@@ -79,11 +79,11 @@
       sub sp, sp, #(((\nlocals + 3) / 2) * 16)
     #+end_src
 
-    Finally, it creates its frame record. (Recall that we saved the callee frame pointer
-    to x10.)
+    Finally, it creates its frame record and moves the frame pointer to point to
+    it. (Recall that we saved the callee frame pointer to x10.)
 
     #+begin_src asm
-      stp x10, lr, [fp]
+      stp x10, lr, [fp, #-16]!
     #+end_src
 *** The epilogue
     :PROPERTIES:
@@ -114,8 +114,8 @@
    #+end_src
 ** Accessing local variables
    We'll also define macros to read and write local variables on the stack. Note that the
-   zeroth local variable is at ~[fp, #-16]~, as ~[fp]~ is the 16-byte frame record (and
-   again, the stack grows downard).
+   zeroth local variable is at ~[fp, #-8]~, as ~[fp]~ is the record (and again, the stack
+   grows downard).
 
    #+begin_src asm :tangle yes
      .macro read_local dst, idx
