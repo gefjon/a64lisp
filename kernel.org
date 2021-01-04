@@ -1,0 +1,262 @@
+* Making the linker happy
+  If we don't define our entry point, the linker will yell at us. All A64 code is 32-bit
+  (4-byte) aligned, which you'd think the assembler would handle automatically, but... it
+  doesn't. ~global~ tells the assembler to make a symbol available to the linker.
+
+  Note that any C symbol's name will be prefixed with an underscore. I don't know why this
+  is, but I know that the linker searches for an entry symbol named ~_main~, which in C
+  would be declared with ~int main();~, and that the linker symbol for the C standard
+  library function ~exit~ is called ~_exit~. (The C standard library function ~_exit~ has
+  a linker symbol named ~__exit~, because why not, right?)
+
+  Once our program is done, we'll call cstdlib's ~exit~ with an argument of zero to
+  cleanly close our process.
+  
+  #+begin_src asm :tangle yes :noweb yes
+      .global _main
+      .align 4
+    _main:
+      <<entry>>
+      mov x0, xzr
+      b _exit
+  #+end_src
+* Macros
+  First, a few macros that will make my life lesss painful.
+** Global address computation with ~adrl~
+   Compute a PC-relative address with a range of ±4GiB, as opposed to the ~adr~
+   instruction's ±1MiB.  GAS and armasm have this as a predefined pseudo-instruction, but
+   Clang doesn't, so here we are.
+   #+begin_src asm :tangle yes
+       .macro adrl reg, sym
+       adrp \reg, \sym\()@PAGE
+       add \reg, \reg, \sym\()@PAGEOFF
+       .endm
+   #+end_src
+** Procedure Call Standard function prologues and epilogues
+   The A64 Procedure Call Standard specifies that the frame pointer should be the head of
+   a linked list of frame records. A frame record is two 64-bit doublewords. The low-index
+   doubleword is a pointer to the previous frame record, i.e. the saved value of the ~fp~
+   register. The high-index doubleword is the return address, i.e. the saved value of the
+   ~lr~ register.
+
+   #+begin_src asm :tangle yes :noweb yes
+       .macro fn_prologue nlocals=0
+       <<fn-prologue>>
+       .endm
+
+       .macro fn_epilogue
+       <<fn-epilogue>>
+       .endm
+   #+end_src
+   
+*** The prologue
+    :PROPERTIES:
+    :header-args: :noweb-ref fn-prologue
+    :END:
+    Our function prologue first stashes the callee stack pointer and frame pointer into
+    scratch registers.
+
+    #+begin_src asm
+      mov sp, x9
+      mov fp, x10
+    #+end_src
+
+    Then, it updates its own frame pointer to the head of the stack.
+
+    #+begin_src asm
+        mov sp, fp
+    #+end_src
+    
+    It then decrements the stack pointer (remember, the stack grows downward) sufficient
+    to store a link register plus a provided number of locals. There's a kind of grody
+    constant expression to calculate the size of the stack frame in bytes: first we
+    compute one more than number of doublewords required by adding three to ~nlocals~ (two
+    for the frame record, plus one more). Then we divide by two to get the number of
+    quadwords, where truncating integer division makes ~7 dwords / 2 -> 3 quadwords~. Then
+    we multiply by 16 to get the number of bytes.
+
+    #+begin_src asm
+      sub sp, sp, #(((\nlocals + 3) / 2) * 16)
+    #+end_src
+
+    Finally, it creates its frame record. (Recall that we saved the callee frame pointer
+    to x10.)
+
+    #+begin_src asm
+      stp x10, lr, [fp]
+    #+end_src
+*** The epilogue
+    :PROPERTIES:
+    :header-args: :noweb-ref fn-epilogue
+    :END:
+    The function epilogue is a lot simpler, as there's no computation. One trick is that,
+    according to the A64 PCS, we have to make sure never to access memory below the stack
+    pointer. A naïve but wrong implementation would be:
+
+    #+begin_src asm :noweb-ref unused
+      mov sp, fp
+      ldp fp, lr, [fp]
+    #+end_src
+
+    Instead, we use an extra instruction and a scratch register so that we can restore the
+    stack pointer only after reading back the frame record.
+
+    #+begin_src asm
+      mov x9, fp
+      ldp fp, lr, [fp]
+      mov sp, x9
+    #+end_src
+   
+    Then, of course, we return.
+   
+    #+begin_src asm
+     ret
+   #+end_src
+** Accessing local variables
+   We'll also define macros to read and write local variables on the stack. Note that the
+   zeroth local variable is at ~[fp, #-16]~, as ~[fp]~ is the 16-byte frame record (and
+   again, the stack grows downard).
+
+   #+begin_src asm :tangle yes
+     .macro read_local dst, idx
+     ldr \dst, [fp, #-((\idx + 2) * 8)]
+     .endm
+
+     .macro write_local src, idx
+     str \src, [fp, #-((\idx + 2) * 8)]
+     .endm
+   #+end_src
+* Object tagging
+  My vote for most undervalued aarch64 feature is Top Byte Ignore, or TBI. If the kernel
+  enables TBI (which both Darwin and Linux do), then address translation will ignore the
+  high eight bits of a pointer, treating them as if sign-extended from bit 55. That is,
+  any of the following pointers refer to the same memory address:
+  - ~0x0000_0000_dead_beef~
+  - ~0x1000_0000_dead_beef~
+  - ~0xa000_0000_dead_beef~
+  - ~0xf000_0000_dead_beef~
+  There's an extension called MTE (Memory Tagging Extension) which uses four of these bits
+  (the low nibble of the top byte, rather than the high 4 bits, for some reason...) to
+  detect common pointer-misuse bugs or exploits like use-after-free or
+  out-of-bounds-write, but to the best of my knowledge neither Darwin nor Linux enable
+  that feature. That means we can use the whole top byte of every doubleword as a type
+  tag!
+
+  Even better, A64 has several instructions (actually aliases of ~bfm~, BitField Move)
+  which will allow us to extract or update tags efficiently.
+
+  ~extract_tag dst, src~ extracts the tag from the register ~src~ and writes it into the
+  low byte of register ~dst~, zeroing the remainder of ~dst~. It does this using ~bfxil~,
+  BitField Extract and Insert Low, which is in fact an alias of ~bfm~.
+  
+  #+begin_src asm :tangle yes
+      .macro extract_tag dst, src
+      mov \dst, xzr
+      bfxil \dst, \src, #56, #8
+      .endm
+  #+end_src
+
+  ~insert_tag obj, tag~ uses the low byte of the register ~tag~ and inserts it into the
+  tag portion of the register ~obj~, leaving the rest of ~obj~ unchanged. It does this
+  using ~bfi~, BitField Insert, another alias of ~bfm~.
+
+  #+begin_src asm :tangle yes
+      .macro insert_tag obj, tag
+      bfi \obj, \tag, #56, #8
+      .endm
+  #+end_src
+
+  We'll define a tag constant for each primitive type we define, named ~tag_foo~ for the
+  type ~foo~.
+
+  #+begin_src asm :tangle yes :noweb yes
+  <<tag-constants>>
+  #+end_src
+** Fixnums
+   The tags ~0x0~ and ~0xf~ (all ones) are both allocated for signed 48-bit integers, called
+   "fixnums" for historical reasons; using both all-zeroes and all-ones allow us to operate
+   on them with normal signed integers, though we must re-tag them after any operation
+   which may overflow or underflow.
+
+   #+begin_src asm :noweb-ref tag-constants
+       .equiv tag_pos_fixnum, 0
+       .equiv tag_neg_fixnum, 0xf
+   #+end_src
+** Object Arrays
+   An object array, or ~obj_arr~, is our simplest indirect object. Just about every part
+   of our Lisp will be implemented in terms of ~obj_arr~ and fixnums.
+
+   An ~obj_arr~ is a series of tagged objects, the first of which must be a non-negative
+   fixnum length. (An ~obj_arr~'s length does not count its length slot, so an empty
+   ~obj_arr~ is one doubleword long and stores zero in that doubleword.)
+
+   We'll use ~1~ as the tag for ~obj_arr~, to keep things simple.
+
+   #+begin_src asm :noweb-ref tag-constants
+       .equiv tag_obj_arr, 1
+   #+end_src
+
+   We define a procedure ~unchecked_alloc_zeroed_obj_arr~ (called ~unchecked~ because it
+   performs no type checking on its argument or overflow checking on intermediate
+   computations; a convention I will attempt to keep), which takes a non-negative fixnum
+   ~length~ as its argument, and returns a pointer to a fresh ~obj_arr~ with ~length~
+   elements, all initialized to zero.
+
+   A little precognition tells us that we need one local variable to make this work.
+
+   #+begin_src asm :tangle yes :noweb yes
+       .global unchecked_alloc_zeroed_obj_arr
+       .align 4
+     unchecked_alloc_zeroed_obj_arr:
+       fn_prologue 1
+       <<alloc-obj-arr>>
+       fn_epilogue
+   #+end_src
+*** Allocation
+    :PROPERTIES:
+    :header-args: :noweb-ref alloc-obj-arr
+    :END:
+    First, we save the length in doublewords to the stack so that we'll be able to write it
+    into the ~obj_arr~ after the allocator call.
+
+    #+begin_src asm
+      write_local x0, 0
+    #+end_src
+
+    Then, we compute the ~obj_arr~'s length in bytes, which will be the argument to the
+    ~malloc~. We add one to get the total length in doublewords, including the length
+    itself, then use a left-shift to multiply.
+
+    #+begin_src asm
+      add x0, x0, #1
+      lsl x0, x0, #3
+    #+end_src
+
+    We call ~malloc~, as we're too lazy to write our own allocator.
+
+    #+begin_src asm
+      bl _malloc
+    #+end_src
+
+    We initialize the length field using our saved value from earlier.
+
+    #+begin_src asm
+      read_local x1, 0
+      str x1, [x0]
+    #+end_src
+
+    Finally, we zero the rest of the array by looping from 1 to the length and writing to
+    that index. Note the use of local labels ~0:~ and ~1:~, and references to them ~0b~
+    (for backward) and ~1f~ (for forward). ~0b~ always refers to the nearest preceding
+    label named ~0~, and ~1f~ always refers to the nearest following label named
+    ~1~. Digits 0 through 9 are allowed.
+
+    #+begin_src asm
+        mov x9, #1
+      0:
+        cmp x9, x1
+        b.eq 1f
+        str xzr, [x0, x9, lsl #3]
+        b 0b
+      1:
+    #+end_src
